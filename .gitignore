@@ -1,0 +1,89 @@
+# ===============================
+# Python
+# ===============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.env/
+.env.*
+.venv/
+
+# ===============================
+# Jupyter
+# ===============================
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# ===============================
+# ML Artifacts
+# ===============================
+artifacts/
+*.pkl
+*.joblib
+*.onnx
+
+# ===============================
+# Data (RAW & PROCESSED)
+# ===============================
+data/raw/
+data/processed/
+*.csv
+*.parquet
+
+# ===============================
+# Logs & Outputs
+# ===============================
+logs/
+*.log
+outputs/
+reports/
+
+# ===============================
+# Database / Secrets
+# ===============================
+*.db
+*.sqlite
+*.sqlite3
+config.yaml
+secrets.yaml
+
+# ===============================
+# OS / Editor
+# ===============================
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# ===============================
+# Testing / Coverage
+# ===============================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ===============================
+# Docker
+# ===============================
+docker-data/
+.env.docker
+
+# ===============================
+# Temporary files
+# ===============================
+tmp/
+*.tmp
+*.swp
