@@ -8,7 +8,7 @@ from sqlalchemy import create_engine
 # -----------------------------
 # Database Configuration
 # -----------------------------
-# DB_URI = "postgresql://username:password@localhost:5432/cic_ids"
+# DB_URI = "postgresql://postgres:1234@localhost:5432/nads_db"
 # TABLE_NAME = "flows_cleaned"
 
 

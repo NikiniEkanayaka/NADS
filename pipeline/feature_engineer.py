@@ -8,7 +8,7 @@ import joblib
 # -----------------------------
 # Database Configuration
 # -----------------------------
-# DB_URI = "postgresql://username:password@localhost:5432/cic_ids"
+# DB_URI = "postgresql://postgres:1234@localhost:5432/nads_db"
 # INPUT_TABLE = "flows_cleaned"
 # OUTPUT_TABLE = "flows_features"
 
