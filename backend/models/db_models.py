@@ -1,9 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey, BigInteger, TIMESTAMP
 from sqlalchemy.sql import func
 from database import Base
-from sqlalchemy.ext.declarative import declarative_base
-
-Base = declarative_base()
 
 class Flow(Base):
     __tablename__ = "flows"
