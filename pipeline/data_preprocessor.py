@@ -1,100 +1,119 @@
 import pandas as pd
 import numpy as np
-import argparse
 import os
+import logging
 from sqlalchemy import create_engine
+from dotenv import load_dotenv
+
+# Load env
+load_dotenv()
+
+# Configure Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-# -----------------------------
-# Database Configuration
-# -----------------------------
-# DB_URI = "postgresql://postgres:1234@localhost:5432/nads_db"
-# TABLE_NAME = "flows_cleaned"
+class DataPreprocessor:
+    def __init__(self, db_url=None):
+        self.db_url = db_url or os.getenv("DATABASE_URL", "postgresql://postgres:1234@localhost:5432/nads_db")
+        self.engine = create_engine(self.db_url)
+        self.medians = {}
+
+        # Map dataset columns → DB columns
+        self.COLUMN_MAPPING = {
+            "Source IP": "src_ip",
+            "Destination IP": "dst_ip",
+            "Source Port": "src_port",
+            "Destination Port": "dst_port",
+            "Protocol": "protocol",
+            "Total Length of Fwd Packets": "bytes_sent",
+            "Total Fwd Packets": "packets",
+            "Flow Duration": "duration",
+        }
+
+        self.VALID_COLS = [
+            "src_ip", "dst_ip", "src_port", "dst_port",
+            "protocol", "bytes_sent", "packets", "duration"
+        ]
+
+    def clean_flow_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df.columns = [col.strip() for col in df.columns]
+
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        for col in ['Flow Bytes/s', 'Flow Packets/s']:
+            if col in df.columns:
+                self.medians[col] = df[col].median()
+                df[col] = df[col].fillna(self.medians[col])
+
+        df.drop_duplicates(inplace=True)
+
+        logger.info(f"Cleaned {len(df)} rows of network data.")
+        return df
+
+    def engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+
+        if "Total Fwd Packets" in df.columns and "Flow Duration" in df.columns:
+            df["Packet_Rate"] = df["Total Fwd Packets"] / (df["Flow Duration"] + 1e-6)
+
+        return df
+
+    def map_to_flows_schema(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df = df.rename(columns=self.COLUMN_MAPPING)
+
+        existing_cols = [c for c in self.VALID_COLS if c in df.columns]
+        df = df[existing_cols]
+
+        # Safe defaults
+        if "src_ip" in df.columns:
+            df["src_ip"] = df["src_ip"].fillna("0.0.0.0")
+        else:
+            df["src_ip"] = "0.0.0.0"
+
+        if "dst_ip" in df.columns:
+            df["dst_ip"] = df["dst_ip"].fillna("0.0.0.0")
+        else:
+            df["dst_ip"] = "0.0.0.0"
+
+        if "protocol" in df.columns:
+            df["protocol"] = df["protocol"].fillna("UNK")
+        else:
+            df["protocol"] = "UNK"
+
+        for col in ["src_port", "dst_port", "packets", "bytes_sent", "duration"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            else:
+                df[col] = 0
+
+        return df
 
 
-# -----------------------------
-# Label Cleaning & Mapping
-# -----------------------------
-def clean_labels(df: pd.DataFrame) -> pd.DataFrame:
-    df['Label'] = (
-        df['Label']
-        .astype(str)
-        .str.replace('ï¿½', '-', regex=False)
-        .str.replace(' ', '-', regex=False)
-        .str.strip()
-    )
-
-    attack_map = {
-        'BENIGN': 'BENIGN',
-        'DDoS': 'DDoS',
-        'DoS-Hulk': 'DoS',
-        'DoS-GoldenEye': 'DoS',
-        'DoS-slowloris': 'DoS',
-        'DoS-Slowhttptest': 'DoS',
-        'PortScan': 'Port Scan',
-        'FTP-Patator': 'Brute Force',
-        'SSH-Patator': 'Brute Force',
-        'Bot': 'Bot',
-        'Web-Attack-Brute-Force': 'Web Attack',
-        'Web-Attack-XSS': 'Web Attack',
-        'Web-Attack-Sql-Injection': 'Web Attack',
-        'Infiltration': 'Infiltration',
-        'Heartbleed': 'Heartbleed'
-    }
-
-    df['Attack Type'] = df['Label'].map(attack_map)
-    df['AttackBinary'] = (df['Label'] != 'BENIGN').astype(int)
-
-    return df
+    def store_to_db(self, df: pd.DataFrame, table_name="flows"):
+        try:
+            df.to_sql(
+                table_name,
+                self.engine,
+                if_exists="append",
+                index=False,
+                chunksize=10000,
+                method="multi"
+            )
+            logger.info(f"Inserted {len(df)} rows into '{table_name}'.")
+        except Exception as e:
+            logger.error(f"Database insertion failed: {e}")
 
 
-# -----------------------------
-# Missing & Infinite Handling
-# -----------------------------
-def handle_missing_and_infinite(df: pd.DataFrame) -> pd.DataFrame:
-    numeric_cols = df.select_dtypes(include=np.number).columns
-
-    # Replace ±inf with NaN
-    df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
-
-    # Drop rows with NaN in critical rate features
-    critical_cols = ['Flow Bytes/s', 'Flow Packets/s']
-    df.dropna(subset=[c for c in critical_cols if c in df.columns], inplace=True)
-
-    return df
-
-
-# -----------------------------
-# Main Preprocessing Function
-# -----------------------------
-def preprocess_csv(csv_path: str) -> pd.DataFrame:
-    print(f"Loading data from {csv_path}")
-    df = pd.read_csv(csv_path, low_memory=False)
-
-    print("Initial shape:", df.shape)
-
-    df.drop_duplicates(inplace=True)
-    df = clean_labels(df)
-    df = handle_missing_and_infinite(df)
-
-    print("Final shape after cleaning:", df.shape)
-    return df
-
-
-# -----------------------------
-# Save to PostgreSQL
-# -----------------------------
-def save_to_postgres(df: pd.DataFrame):
-    engine = create_engine(DB_URI)
-    df.to_sql(TABLE_NAME, engine, if_exists='replace', index=False)
-    print(f"Data saved to PostgreSQL table '{TABLE_NAME}'")
-
-
-# -----------------------------
-# Script Entry Point
-# -----------------------------
 if __name__ == "__main__":
-    INPUT_CSV = "data/raw/cic_ids.csv"
+    processor = DataPreprocessor()
 
-    df_cleaned = preprocess_csv(INPUT_CSV)
-    save_to_postgres(df_cleaned)
+    raw_data = pd.read_csv("data/All_dataset.csv")
+
+    clean_data = processor.clean_flow_data(raw_data)
+    feat_data = processor.engineer_features(clean_data)
+    db_ready_data = processor.map_to_flows_schema(feat_data)
+
+    processor.store_to_db(db_ready_data)

@@ -1,106 +1,184 @@
+# retrain_pipeline.py
+import os
+import logging
+import joblib
 import pandas as pd
 import numpy as np
-import joblib
 import psycopg2
-import logging
-from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import f1_score, roc_auc_score, average_precision_score, precision_recall_curve
-import os
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import (
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    precision_recall_curve
+)
 from dotenv import load_dotenv
 
 load_dotenv()
 
-DB_CONFIG = {
-    "dbname": os.getenv("DB_NAME"),     
-    "user": os.getenv("DB_USER"),       
-    "password": os.getenv("DB_PASSWORD"),
-    "host": os.getenv("DB_HOST", "localhost"), 
-    "port": int(os.getenv("DB_PORT", 5432))
-}
-
-OLD_MODEL_PATH = "model.pkl"
-NEW_MODEL_PATH = "model_retrained.pkl"
-
+# ------------------------------
+# Logging
+# ------------------------------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 # ------------------------------
-# FETCH FEEDBACK
+# PostgreSQL config
+# ------------------------------
+DB_CONFIG = {
+    "dbname": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": int(os.getenv("DB_PORT", 5432))
+}
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OLD_MODEL_PATH = os.path.join(BASE_DIR, "model.pkl")
+NEW_MODEL_PATH = os.path.join(BASE_DIR, "model_retrained.pkl")
+
+# ------------------------------
+# SELECTED FEATURES
+# ------------------------------
+SELECTED_FEATURES = [
+    'Destination Port',
+    'Flow Duration',
+    'Total Fwd Packets',
+    'Total Backward Packets',
+    'Down/Up Ratio',
+    'Average Packet Size',
+    'Packet Length Mean',
+    'Packet Length Std',
+    'Min Packet Length',
+    'Max Packet Length',
+    'Packet Length Variance',
+    'Fwd Packets/s',
+    'Bwd Packets/s',
+    'SYN Flag Count',
+    'FIN Flag Count',
+    'RST Flag Count',
+    'PSH Flag Count',
+    'ACK Flag Count',
+    'URG Flag Count',
+    'Init_Win_bytes_forward',
+    'Init_Win_bytes_backward',
+    'Avg Fwd Segment Size',
+    'Avg Bwd Segment Size',
+    'Fwd Header Length',
+    'Bwd Header Length',
+    'Subflow Fwd Packets',
+    'Subflow Bwd Packets'
+]
+
+# ------------------------------
+# Fetch feedback data
 # ------------------------------
 def fetch_feedback_data():
-    """Fetch analyst-verified flows and labels."""
+
     query = """
-    SELECT f.id, f.bytes_sent, f.packets, f.duration, fb.label
-    FROM flows f JOIN alerts a ON f.id = a.flow_id JOIN feedback fb ON a.id = fb.alert_id
+        SELECT f.id, f.bytes_sent, f.packets, f.duration, f.dst_port,
+               fb.label
+        FROM flows f
+        JOIN alerts a ON f.id = a.flow_id
+        JOIN feedback fb ON a.id = fb.alert_id
     """
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         df = pd.read_sql(query, conn)
         conn.close()
+        logging.info(f"📥 Retrieved {len(df)} feedback samples from DB")
         return df
     except Exception as e:
         logging.error(f"Database connection failed: {e}")
         return None
 
 # ------------------------------
-# RETRAIN PIPELINE
+# Reconstruct features from DB
 # ------------------------------
-                                            # min_samples = 5 ONLY for testing purpose
+def build_features(df):
+    X = pd.DataFrame()
+    
+    # Basic features
+    X['Destination Port'] = df['dst_port']
+    X['Flow Duration'] = df['duration']
+    X['Total Fwd Packets'] = df['packets']
+    X['Total Backward Packets'] = 0  
+    X['Fwd Packets/s'] = df['packets'] / (df['duration'] + 1e-6)
+    X['Bwd Packets/s'] = 0
+    X['Min Packet Length'] = 0
+    X['Max Packet Length'] = df['bytes_sent']
+    X['Packet Length Mean'] = df['bytes_sent'] / (df['packets'] + 1e-6)
+    X['Packet Length Std'] = 0
+    X['Packet Length Variance'] = 0
+    X['Average Packet Size'] = df['bytes_sent'] / (df['packets'] + 1e-6)
+    X['Down/Up Ratio'] = 0
+    X['SYN Flag Count'] = 0
+    X['FIN Flag Count'] = 0
+    X['RST Flag Count'] = 0
+    X['PSH Flag Count'] = 0
+    X['ACK Flag Count'] = 0
+    X['URG Flag Count'] = 0
+    X['Init_Win_bytes_forward'] = 0
+    X['Init_Win_bytes_backward'] = 0
+    X['Avg Fwd Segment Size'] = 0
+    X['Avg Bwd Segment Size'] = 0
+    X['Fwd Header Length'] = 0
+    X['Bwd Header Length'] = 0
+    X['Subflow Fwd Packets'] = 0
+    X['Subflow Bwd Packets'] = 0
+    
+
+    X = X[SELECTED_FEATURES]
+    
+    return X
+
+# ------------------------------
+# Retrain model
+# ------------------------------
 def retrain_model(min_samples: int = 5):
     logging.info("🚀 Starting retraining pipeline...")
 
-    # 1️⃣ Load existing model artifact
-    if not os.path.exists(OLD_MODEL_PATH):
-        logging.warning(f"⚠️  Existing model not found at {OLD_MODEL_PATH}, training from scratch")
-        artifact = {}
-    else:
+    # Load old model if exists
+    if os.path.exists(OLD_MODEL_PATH):
         artifact = joblib.load(OLD_MODEL_PATH)
+        logging.info(f"✅ Loaded existing model from {OLD_MODEL_PATH}")
+    else:
+        artifact = None
+        logging.warning("⚠️ No existing model found. Training from scratch")
 
-    # 2️⃣ Load feedback data
-    feedback_df = fetch_feedback_data()
-    if feedback_df is None or len(feedback_df) < min_samples:
-        logging.warning(f"❗ Not enough feedback data for retraining. Found: {len(feedback_df) if feedback_df is not None else 0}")
+    # Load feedback data
+    df_feedback = fetch_feedback_data()
+    if df_feedback is None or len(df_feedback) < min_samples:
+        logging.warning(f"❗ Not enough feedback data for retraining. Found: {len(df_feedback) if df_feedback is not None else 0}")
         return
-    logging.info(f"📥 Loaded {len(feedback_df)} feedback samples")
 
-    # 3️⃣ Build feature set from flows table + engineered features
-    X = pd.DataFrame()
-    X['bytes_sent'] = feedback_df['bytes_sent']
-    X['packets'] = feedback_df['packets']
-    X['duration'] = feedback_df['duration']
-    X['packet_rate'] = feedback_df['packets'] / (feedback_df['duration'] + 1e-6)
-    X['bytes_per_packet'] = feedback_df['bytes_sent'] / (feedback_df['packets'] + 1e-6)
+    # Build features
+    X = build_features(df_feedback)
+    y = df_feedback['label'].astype(int)  # 0 = Normal, 1 = Attack
 
-    # 4️⃣ Scale features
+    # Scale features
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # 5️⃣ Prepare labels (0=Normal, 1=Attack)
-    y = feedback_df['label'].astype(int)
-
-    # 6️⃣ Train Isolation Forest
-    # contamination = y.mean()
-    contamination = len(y[y == 1]) / len(y)
-    contamination = max(0.01, min(contamination, 0.5))
-    logging.info(f"🧪 Training Isolation Forest with contamination={contamination:.3f}")
-
+    # Train Isolation Forest
+    contamination = max(0.01, min(y.mean(), 0.5))
     model = IsolationForest(
-        n_estimators=200,
-        max_samples=0.6,
+        n_estimators=300,
+        max_samples="auto",
         contamination=contamination,
         random_state=42,
         n_jobs=-1
     )
     model.fit(X_scaled)
 
-    # 7️⃣ Threshold optimization
+    # Threshold optimization
     scores = -model.decision_function(X_scaled)
     precision, recall, thresholds = precision_recall_curve(y, scores)
     f1_scores = 2 * (precision * recall) / (precision + recall + 1e-9)
     best_idx = np.argmax(f1_scores)
     best_threshold = thresholds[best_idx]
 
-    # 8️⃣ Evaluation
+    # Evaluation metrics
     y_pred = (scores >= best_threshold).astype(int)
     f1 = f1_score(y, y_pred)
     roc_auc = roc_auc_score(y, scores)
@@ -111,20 +189,19 @@ def retrain_model(min_samples: int = 5):
     logging.info(f"ROC-AUC        : {roc_auc:.4f}")
     logging.info(f"Avg Precision  : {pr_auc:.4f}")
 
-    # 9️⃣ Save updated model
-    new_artifact = {
+    # Save retrained model
+    artifact_new = {
         "model": model,
         "scaler": scaler,
         "threshold": best_threshold,
-        "features": X.columns.tolist(),
-        "retrained_on_samples": len(feedback_df)
+        "features": SELECTED_FEATURES,
+        "retrained_on_samples": len(df_feedback)
     }
-    joblib.dump(new_artifact, NEW_MODEL_PATH)
+    joblib.dump(artifact_new, NEW_MODEL_PATH)
     logging.info(f"✅ Retrained model saved to {NEW_MODEL_PATH}")
 
-
 # ------------------------------
-# ENTRY POINT
+# Main
 # ------------------------------
 if __name__ == "__main__":
     retrain_model()

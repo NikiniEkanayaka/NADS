@@ -1,99 +1,194 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sqlalchemy import create_engine
+import os
+import logging
 import joblib
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
+
+# Load env
+load_dotenv()
+
+# Configure Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-# -----------------------------
-# Database Configuration
-# -----------------------------
-# DB_URI = "postgresql://postgres:1234@localhost:5432/nads_db"
-# INPUT_TABLE = "flows_cleaned"
-# OUTPUT_TABLE = "flows_features"
+SELECTED_FEATURES = [
+    'Flow Duration',
+    'Total Fwd Packets',
+    'Total Backward Packets',
+    'Down/Up Ratio',
+    'Average Packet Size',
+    'Packet Length Mean',
+    'Packet Length Std',
+    'Min Packet Length',
+    'Max Packet Length',
+    'Packet Length Variance',
+    'Fwd Packets/s',
+    'Bwd Packets/s',
+    'SYN Flag Count',
+    'FIN Flag Count',
+    'RST Flag Count',
+    'PSH Flag Count',
+    'ACK Flag Count',
+    'URG Flag Count',
+    'Init_Win_bytes_forward',
+    'Init_Win_bytes_backward',
+    'Avg Fwd Segment Size',
+    'Avg Bwd Segment Size',
+    'Destination Port',
+    'Fwd Header Length',
+    'Bwd Header Length',
+    'Subflow Fwd Packets',
+    'Subflow Bwd Packets'
+]
 
+# ===== DB column mapping =====
+COLUMN_MAPPING = {
+    "Source IP": "src_ip",
+    "Destination IP": "dst_ip",
+    "Source Port": "src_port",
+    "Destination Port": "dst_port",
+    "Protocol": "protocol",
+    "Total Length of Fwd Packets": "bytes_sent",
+    "Total Fwd Packets": "packets",
+    "Flow Duration": "duration"
+}
 
-# -----------------------------
-# Feature Engineering
-# -----------------------------
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+VALID_DB_COLS = [
+    "src_ip", "dst_ip", "src_port", "dst_port",
+    "protocol", "bytes_sent", "packets", "duration",
+    "anomaly_score"
+]
 
-    # Avoid divide-by-zero
-    df['Flow Duration'] = df['Flow Duration'].replace(0, np.nan)
+class NADSProcessor:
+    def __init__(self, db_url=None):
+        self.db_url = db_url or os.getenv(
+            "DATABASE_URL", "postgresql://postgres:1234@localhost:5432/nads_db"
+        )
+        self.engine = create_engine(self.db_url)
 
-    # Packet rate
-    df['packet_rate'] = (
-        (df['Total Fwd Packets'] + df['Total Backward Packets']) /
-        df['Flow Duration']
-    )
+        # Load model + scaler
+        self.model_bundle_path = os.getenv("MODEL_PATH", "models/model.pkl")
+        if os.path.exists(self.model_bundle_path):
+            bundle = joblib.load(self.model_bundle_path)
+            self.model = bundle.get("model")
+            self.scaler = bundle.get("scaler")
+            self.model_features = bundle.get("features", SELECTED_FEATURES)
+            logger.info("Loaded model + scaler + features from bundle.")
+        else:
+            self.model = None
+            self.scaler = None
+            self.model_features = SELECTED_FEATURES
+            logger.warning("Model bundle not found, anomaly scores will not be computed.")
 
-    # Byte rate
-    df['byte_rate'] = (
-        (df['Total Length of Fwd Packets'] +
-         df['Total Length of Bwd Packets']) /
-        df['Flow Duration']
-    )
+        self.medians = {}
 
-    # Port-based features
-    if 'Destination Port' in df.columns:
-        df['is_well_known_port'] = (df['Destination Port'] < 1024).astype(int)
-        df['is_high_port'] = (df['Destination Port'] > 49152).astype(int)
+    # --------------------------
+    # Data cleaning
+    # --------------------------
+    def clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df.columns = [col.strip() for col in df.columns]
 
-    # Replace NaN created by division
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.fillna(0, inplace=True)
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    return df
+        for col in ["Flow Bytes/s", "Flow Packets/s"]:
+            if col in df.columns:
+                self.medians[col] = df[col].median()
+                df[col] = df[col].fillna(self.medians[col])
 
+        df.drop_duplicates(inplace=True)
+        logger.info(f"Cleaned {len(df)} rows of network data.")
+        return df
 
-# -----------------------------
-# Normalization
-# -----------------------------
-def normalize_features(df: pd.DataFrame):
-    exclude_cols = [
-        'Label', 'Attack Type', 'AttackBinary'
-    ]
+    # --------------------------
+    # Feature engineering
+    # --------------------------
+    def engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Select features for ML model."""
+        df = df.copy()
+        available_features = [f for f in self.model_features if f in df.columns]
+        if len(available_features) < len(self.model_features):
+            missing = set(self.model_features) - set(available_features)
+            logger.warning(f"Missing features dropped: {missing}")
+        X = df[available_features]
+        return X
 
-    feature_cols = [
-        c for c in df.columns
-        if c not in exclude_cols and df[c].dtype != 'object'
-    ]
+    # --------------------------
+    # Feature scaling
+    # --------------------------
+    def scale_features(self, X: pd.DataFrame) -> pd.DataFrame:
+        if self.scaler:
+            scaled = self.scaler.transform(X)
+            X_scaled = pd.DataFrame(scaled, columns=X.columns, index=X.index)
+            return X_scaled
+        return X
 
-    scaler = StandardScaler()
-    df[feature_cols] = scaler.fit_transform(df[feature_cols])
+    # --------------------------
+    # Anomaly scoring
+    # --------------------------
+    def calculate_anomaly_score(self, X: pd.DataFrame) -> pd.Series:
+        if self.model:
+            # IsolationForest decision_function returns higher = normal, lower = anomaly
+            score = self.model.decision_function(X)
+            return pd.Series(score, index=X.index)
+        else:
+            return pd.Series(np.nan, index=X.index)
 
-    joblib.dump(scaler, "artifacts/standard_scaler.pkl")
-    print("Scaler saved to artifacts/standard_scaler.pkl")
+    # --------------------------
+    # Map to DB schema
+    # --------------------------
+    def map_to_db_schema(self, df: pd.DataFrame, raw_df: pd.DataFrame, anomaly_scores: pd.Series) -> pd.DataFrame:
+        """Map raw CSV + anomaly scores to flows table schema."""
+        df = raw_df.rename(columns=COLUMN_MAPPING)
+        existing_cols = [c for c in VALID_DB_COLS if c in df.columns]
+        df = df[existing_cols]
 
-    return df, feature_cols
+        # Fill missing data safely
+        df["src_ip"] = df.get("src_ip", pd.Series("0.0.0.0", index=df.index)).fillna("0.0.0.0")
+        df["dst_ip"] = df.get("dst_ip", pd.Series("0.0.0.0", index=df.index)).fillna("0.0.0.0")
+        df["protocol"] = df.get("protocol", pd.Series("UNK", index=df.index)).fillna("UNK")
 
+        for col in ["src_port", "dst_port", "packets", "bytes_sent", "duration"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            else:
+                df[col] = pd.Series(0, index=df.index)
 
-# -----------------------------
-# Load & Save Helpers
-# -----------------------------
-def load_from_postgres() -> pd.DataFrame:
-    engine = create_engine(DB_URI)
-    return pd.read_sql(INPUT_TABLE, engine)
+        # Add anomaly scores
+        df["anomaly_score"] = anomaly_scores
 
+        return df
 
-def save_to_postgres(df: pd.DataFrame):
-    engine = create_engine(DB_URI)
-    df.to_sql(OUTPUT_TABLE, engine, if_exists='replace', index=False)
-    print(f"Feature-engineered data saved to '{OUTPUT_TABLE}'")
+    # --------------------------
+    # Store in DB
+    # --------------------------
+    def store_to_db(self, df: pd.DataFrame, table_name="flows"):
+        try:
+            df.to_sql(
+                table_name,
+                self.engine,
+                if_exists="append",
+                index=False,
+                chunksize=10000,
+                method="multi"
+            )
+            logger.info(f"Inserted {len(df)} rows into '{table_name}'.")
+        except Exception as e:
+            logger.error(f"Database insertion failed: {e}")
 
-
-# -----------------------------
-# Script Entry Point
-# -----------------------------
+# ==============================
+# Main pipeline
+# ==============================
 if __name__ == "__main__":
-    print("Loading cleaned data from PostgreSQL...")
-    df = load_from_postgres()
+    processor = NADSProcessor()
 
-    print("Engineering features...")
-    df = engineer_features(df)
-
-    print("Normalizing features...")
-    df, feature_cols = normalize_features(df)
-
-    save_to_postgres(df)
+    raw_data = pd.read_csv("data/All_dataset.csv")
+    clean_df = processor.clean_data(raw_data)
+    feat_df = processor.engineer_features(clean_df)
+    scaled_df = processor.scale_features(feat_df)
+    anomaly_scores = processor.calculate_anomaly_score(scaled_df)
+    db_ready_df = processor.map_to_db_schema(scaled_df, raw_data, anomaly_scores)
+    processor.store_to_db(db_ready_df, table_name="flows")
