@@ -3,10 +3,11 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 import numpy as np
 import joblib
-
+from backend.core.deps import get_current_user
 from backend.models.db_models import Flow, Alert, Feedback
 from backend.database import SessionLocal
 from backend.core.model_loader import model, scaler, threshold, features
+from backend.core.deps import require_role
 
 router = APIRouter()
 
@@ -111,7 +112,7 @@ def map_flow_to_model_features(flow: FlowInput) -> np.ndarray:
 
 # --- Predict endpoint ---
 @router.post("/predict")
-def predict(flow: FlowInput, db: Session = Depends(get_db)):
+def predict(flow: FlowInput, db: Session = Depends(get_db), user=Depends(require_role(["admin", "analyst"]))):
     try:
         if model is None:
             raise HTTPException(status_code=500, detail="Model not loaded")
@@ -160,13 +161,13 @@ def predict(flow: FlowInput, db: Session = Depends(get_db)):
 
 # --- Alerts endpoint ---
 @router.get("/alerts")
-def get_alerts(db: Session = Depends(get_db)):
+def get_alerts(db: Session = Depends(get_db), user=Depends(require_role(["admin"]))):
     return db.query(Alert).order_by(Alert.created_at.desc()).all()
 
 
 # --- Feedback endpoint ---
 @router.post("/feedback")
-def submit_feedback(data: FeedbackInput, db: Session = Depends(get_db)):
+def submit_feedback(data: FeedbackInput, db: Session = Depends(get_db), user=Depends(require_role(["analyst"]))):
     feedback = Feedback(**data.model_dump())
     db.add(feedback)
     db.commit()

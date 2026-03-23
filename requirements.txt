@@ -5,3 +5,7 @@ sqlalchemy
 psycopg2-binary
 joblib
 python-dotenv
+python-jose
+passlib[bcrypt]==1.7.4
+jose
+bcrypt==3.2.2
