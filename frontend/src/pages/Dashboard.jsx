@@ -7,7 +7,7 @@ import ScoreChart from "../components/ScoreChart";
 import { FaBell, FaChartLine, FaCheckCircle, FaExclamationTriangle } from "react-icons/fa";
 import { FiRefreshCw } from "react-icons/fi";
 
-export default function Dashboard({ user }) {
+export default function Dashboard({ user, token }) {
   const isAnalyst = user?.role === "analyst";
   const [alerts, setAlerts] = useState([]);
   const [selected, setSelected] = useState(null);
